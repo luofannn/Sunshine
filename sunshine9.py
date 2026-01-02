@@ -15,11 +15,11 @@ def load_excel_and_preprocess(excel_path):
 
 def solar_cell_model(V_data):
     """使用导师参数计算理论电流"""
-    I_ph = 4.244661601268746
-    I0 = 1.9507404859873916e-46
-    n = 1.142872079727331
-    Rs = 0.06669084370651734
-    Rsh = 49.93330915629348
+    I_ph = 2.1528757798522964
+    I0 = 6.4615626519206425e-53
+    n = 1.0000002154239138
+    Rs = 0.08615300523421933
+    Rsh = 98.79363723408738
     Vt = 0.026
 
     I_theory = np.zeros_like(V_data)
@@ -50,7 +50,7 @@ def solar_cell_model(V_data):
 
 def main():
     # 数据文件路径
-    excel_path = r"C:\Users\18372\PycharmProjects\pythonProject1\1.xls"
+    excel_path = r"C:\Users\18372\PycharmProjects\pythonProject1\11.xls"
 
     try:
         # 加载数据
