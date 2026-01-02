@@ -112,20 +112,6 @@ def objective_function(params, V, I_meas, I_min, I_max):
         return 1e10
     return loss
 
-#TLBO算法实现
-# ========== TLBO 算法超参数 ==========
-# POP_SIZE = 30          # 种群大小（学生数量）
-# MAX_ITER = 100         # 最大迭代次数
-# PARAM_DIM = 5          # 要优化的参数维度：[I_ph, I0, n, Rs, Rsh]
-#
-# # 参数搜索范围（请务必根据你的物理模型调整！）
-# PARAM_BOUNDS = np.array([
-#     [0.1, 8],  # I_ph: 参考值4.2在此范围内，但上下限宽松
-#     [1e-60, 1e-20],  # I0: **关键！** 鉴于参考值极小且不确定，必须用极宽的对数范围覆盖可能区间
-#     [1.0, 2.0],  # n: 保持标准物理范围
-#     [0.01, 0.5],  # Rs: 适当放宽，包含参考值0.067
-#     [20, 5000]  # Rsh: 放宽范围，既包含参考值50，也包含您原设的较高值
-# ])
 class TLBO:
     def __init__(self,V: np.ndarray,I_meas: np.ndarray,I_min: float,I_max: float,pop_size: int = 30, max_iter: int = 100,param_bounds: Optional[np.ndarray] = None):
         assert len(V) == len(I_meas), "电压和电流数据长度必须一致"
@@ -147,11 +133,11 @@ class TLBO:
         else:
             # 合理的默认物理边界（基于典型太阳能电池参数）
             self.param_bounds = np.array([
-                [0.1, 10.0],  # I_ph: 光生电流 (A)，覆盖常见范围
-                [1e-100, 1e-1],  # I0: 反向饱和电流 (A)，关键参数！
-                [1.0, 1.3],  # n: 理想因子，物理约束1-2
-                [0.01, 1000],  # Rs: 串联电阻 (Ω)，通常较小
-                [1000, 1e6]  # Rsh: 并联电阻 (Ω)，通常较大
+                [0.1, 10.0],  # I_ph
+                [1e-60,1e-50],  # I0 - 放宽范围
+                [1.0, 1.3],  # n - 放宽范围
+                [0.001, 0.5],  # Rs
+                [50, 150]  # Rsh
             ], dtype=np.float64)
         # 运行状态变量（会在优化过程中初始化）
         self.population = None  # 当前种群，形状(pop_size, param_dim)
@@ -365,16 +351,16 @@ class TLBO:
 # ========== 主程序示例 ==========
 if __name__ == "__main__":
     # 1. 加载你的数据（使用你现有的函数）
-    excel_path = r"C:\Users\18372\PycharmProjects\pythonProject1\1.xls"  # 替换为你的文件路径
+    excel_path = r"C:\Users\18372\PycharmProjects\pythonProject1\11.xls"  # 替换为你的文件路径
     V_processed, I_meas_processed, _, _, I_min, I_max = load_excel_and_preprocess(excel_path)
 
     # 2. (可选) 自定义参数边界 - 如果不指定，将使用类中的默认值
     custom_bounds = np.array([
-        [0.1, 10.0],  # I_ph: 光生电流 (A)，覆盖常见范围
-        [1e-100, 1e-1],  # I0: 反向饱和电流 (A)，关键参数！
-        [1.0, 1.3],  # n: 理想因子，物理约束1-2
-        [0.01, 1000],  # Rs: 串联电阻 (Ω)，通常较小
-        [1000, 1e6]  # Rsh: 并联电阻 (Ω)，通常较大
+        [0.1, 10.0],  # I_ph
+        [1e-60, 1e-50],  # I0 - 放宽范围
+        [1.0, 1.3],  # n - 放宽范围
+        [0.001, 0.5],  # Rs
+        [50, 150]  # Rsh
     ])
 
     # 3. 创建TLBO优化器实例

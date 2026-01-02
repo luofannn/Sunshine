@@ -147,11 +147,11 @@ class TLBO:
         else:
             # 合理的默认物理边界（基于典型太阳能电池参数）
             self.param_bounds = np.array([
-                [0.1, 10.0],  # I_ph: 光生电流 (A)，覆盖常见范围
-                [1e-100, 1e-1],  # I0: 反向饱和电流 (A)，关键参数！
-                [1.0, 1.3],  # n: 理想因子，物理约束1-2
-                [0.01, 1000],  # Rs: 串联电阻 (Ω)，通常较小
-                [1000, 1e6]  # Rsh: 并联电阻 (Ω)，通常较大
+                [0.1, 10.0],  # I_ph
+                [1e-60, 1e-50],  # I0 - 放宽范围
+                [1.0, 1.3],  # n - 放宽范围
+                [0.001, 0.5],  # Rs
+                [50, 150]  # Rsh
             ], dtype=np.float64)
         # 运行状态变量（会在优化过程中初始化）
         self.population = None  # 当前种群，形状(pop_size, param_dim)
@@ -365,16 +365,16 @@ class TLBO:
 # ========== 主程序示例 ==========
 if __name__ == "__main__":
     # 1. 加载你的数据（使用你现有的函数）
-    excel_path = r"C:\Users\18372\PycharmProjects\pythonProject1\1.xls"  # 替换为你的文件路径
+    excel_path = r"C:\Users\18372\PycharmProjects\pythonProject1\11.xls"  # 替换为你的文件路径
     V_processed, I_meas_processed, _, _, I_min, I_max = load_excel_and_preprocess(excel_path)
 
     # 2. (可选) 自定义参数边界 - 如果不指定，将使用类中的默认值
     custom_bounds = np.array([
-        [0.1, 10.0],  # I_ph: 光生电流 (A)，覆盖常见范围
-        [1e-100, 1e-1],  # I0: 反向饱和电流 (A)，关键参数！
-        [1.0, 1.3],  # n: 理想因子，物理约束1-2
-        [0.01, 1000],  # Rs: 串联电阻 (Ω)，通常较小
-        [1000, 1e6]  # Rsh: 并联电阻 (Ω)，通常较大
+        [0.1, 10.0],  # I_ph
+        [1e-60, 1e-50],  # I0 - 放宽范围
+        [1.0, 1.3],  # n - 放宽范围
+        [0.001, 0.5],  # Rs
+        [50, 150]  # Rsh
     ])
 
     # 3. 创建TLBO优化器实例
