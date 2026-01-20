@@ -162,11 +162,11 @@ class Q_TLBO:
             self.param_bounds = param_bounds.astype(np.float64)
         else:
             self.param_bounds = np.array([
-                [0.01, 200.0],  # R_sh（并联电阻）：0.01~200Ω
+                [1e-4, 300.0],  # I_ph（光生电流）：1e-4~300 A（覆盖更小弱光电流）
                 [1e-70, 1e-10],  # I₀（反向饱和电流）：1e-70~1e-10 A（包含1e-53这类极小数）
                 [1.0, 2.2],  # n（理想因子）：1.0~2.2（覆盖特殊薄膜电池）
                 [0.00001, 2.0],  # R_s（串联电阻）：0.00001~2Ω（更宽的mΩ级场景）
-                [1e-4, 300.0]  # I_ph（光生电流）：1e-4~300 A（覆盖更小弱光电流）
+                [0.01, 200.0],  # R_sh（并联电阻）：0.01~200Ω
             ], dtype=np.float64)
 
         # 运行状态变量
@@ -511,7 +511,7 @@ class Q_TLBO:
 
 # ========== 主程序示例 ==========
 if __name__ == "__main__":
-    excel_path = r"C:\Users\18372\PycharmProjects\pythonProject1\11.xls"
+    excel_path = r"C:\Users\18372\PycharmProjects\pythonProject1\5.xls"
 
     try:
         V_processed, I_meas_processed, _, _, I_min, I_max = load_excel_and_preprocess(excel_path)
