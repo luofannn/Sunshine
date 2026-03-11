@@ -23,7 +23,7 @@ class ObjectiveFunctionError(Exception):
     pass
 
 class Actor(nn.Module):
-    def __init__(self,state_dim=10,action_dim=5,hidden_dim=256):
+    def __init__(self,state_dim=9,action_dim=5,hidden_dim=256):
         super(Actor,self).__init__()
 
         self.fc1 = nn.Linear(state_dim,hidden_dim)
@@ -33,7 +33,26 @@ class Actor(nn.Module):
         self.fc3 = nn.Linear(hidden_dim, action_dim)
 
 
-        self.action_scale = 0.1  # 更小步长，便于在 0.28 附近做精细调整
+        self.action_scale_base = 0.1  # 默认步长
+
+    def get_action_scale(self, best_error: float | None = None) -> float:
+        """根据当前最佳误差自适应调整步长，误差越低步长越小便于精细搜索"""
+        if best_error is None:
+            return self.action_scale_base
+        # 只有当误差非常低时才使用极小步长
+        if best_error <= 0.05:
+            return 0.001
+        if best_error <= 0.10:
+            return 0.002
+        if best_error <= 0.15:
+            return 0.005
+        if best_error <= 0.20:
+            return 0.01
+        if best_error <= 0.30:
+            return 0.02      # 误差在 0.2~0.3 之间时步长 0.02
+        if best_error <= 0.40:
+            return 0.05      # 误差在 0.3~0.4 时步长 0.05
+        return 0.1            # 误差 >0.4 时使用基础步长 0.1
 
     def forward(self,state):
         x = self.fc1(state)
@@ -43,7 +62,7 @@ class Actor(nn.Module):
         x = self.ln2(x)
         x = F.relu(x)
         raw_action =torch.tanh(self.fc3(x))
-        scaled_action =raw_action * self.action_scale
+        scaled_action =raw_action * self.action_scale_base
         return scaled_action
 
 class Env:
@@ -60,6 +79,9 @@ class Env:
             [0.001, 0.3],  # Rs
             [10.0, 300.0], # Rsh
         ], dtype=np.float64)
+        # I0 对数空间边界（与传统优化一致，便于 RL 精细调整）
+        self._log_I0_low = np.log(max(self.param_bounds[1, 0], 1e-80))
+        self._log_I0_high = np.log(self.param_bounds[1, 1])
 
         self.errors={}
 
@@ -70,7 +92,7 @@ class Env:
             0.0775,  # Rs: (0.005+0.15)/2 = 0.0775
             77.5,  # Rsh: (5.0+150.0)/2 = 77.5
         ])
-        self.state_dim=10
+        self.state_dim=9
         self.action_dim=5
         # 环境状态
         self.current_params = None
@@ -80,6 +102,7 @@ class Env:
         self.best_params = None
         self.prev_error = None
         self.prev_params = None
+        self.rl_start_error = 0.5  # 传统优化初始误差，供_build_state精细归一化用，main中会覆盖
 
         # 计算热电压 (假设温度为25°C)
         self.Vt = 0.026  # 热电压 (V)
@@ -88,11 +111,11 @@ class Env:
         self.reward_weights = {
             'main_error': 1.0,  # 主误差（整体拟合）
             'boundary': 0.025,  # 边界惩罚，避免参数贴边
-            'mpp': 0.25,  # 最大功率点误差，拐点区域关键
-            'short_circuit': 0.15,  # 短路电流误差
-            'open_voltage': 0.15,  # 开路电压误差
+            'mpp': 0.0,  # 最大功率点误差
+            'short_circuit': 0.0,  # 短路电流误差
+            'open_voltage': 0.0,  # 开路电压误差
             'action_penalty': 0,  # 动作惩罚（保持 0，由 action_scale 控制）
-            'fill_factor': 0.1,  # 填充因子误差，反映整体曲线形状
+            'fill_factor': 0.0,  # 填充因子误差
             'step_penalty': 0,  # 步数惩罚（保持 0，允许充分探索）
         }
 
@@ -171,7 +194,7 @@ class Env:
                 return 1.0 + (I0 * Rs / (n * Vt)) * exp_term + Rs / Rsh
 
             init_I = prev_I if i > 0 else float(I_ph)
-            for _ in range(3):  # 预热迭代，保证初值足够好
+            for _ in range(1):  # 预热迭代，保证初值足够好
                 if not np.isfinite(init_I):
                     init_I = I_ph  # 如果异常，重置为I_ph
                     break
@@ -190,7 +213,7 @@ class Env:
                 init_I = I_ph * 0.95  # 如果初始值异常，使用接近I_ph的值
 
             I_i = init_I
-            for iter_count in range(50):  # 恢复足够迭代，保证拟合阶段模型精度
+            for iter_count in range(20):  # 正式迭代
                 # 使用牛顿法而非固定点迭代，提高高电压区收敛性，确保陡降段能正确计算
                 f_val = f(I_i)
                 fp_val = f_prime(I_i)
@@ -210,7 +233,7 @@ class Env:
                 if abs(I_new - I_i) < 1e-8:
                     I_i = I_new
                     break
-                if iter_count >= 25 and abs(I_new - I_i) < 1e-5:
+                if iter_count >= 10 and abs(I_new - I_i) < 1e-5:
                     I_i = I_new
                     break
                 I_i = I_new
@@ -251,22 +274,32 @@ class Env:
         return float(loss)
 
     def _normalize_params(self, params: np.ndarray) -> np.ndarray:
-        """归一化参数到[0, 1]范围"""
+        """归一化参数到[0, 1]范围。I0 在对数空间归一化，与传统优化一致"""
         norm_params = np.zeros_like(params)
 
         for i in range(len(params)):
-            min_val, max_val = self.param_bounds[i]
-            norm_params[i] = (params[i] - min_val) / (max_val - min_val)
-            norm_params[i] = np.clip(norm_params[i], 0, 1)
+            if i == 1:  # I0: 对数空间
+                I0_safe = max(float(params[1]), 1e-80)
+                log_I0 = np.log(I0_safe)
+                norm_params[i] = (log_I0 - self._log_I0_low) / (self._log_I0_high - self._log_I0_low)
+            else:
+                min_val, max_val = self.param_bounds[i]
+                norm_params[i] = (params[i] - min_val) / (max_val - min_val)
+            norm_params[i] = float(np.clip(norm_params[i], 0, 1))
 
         return norm_params
 
     def _denormalize_params(self, norm_params: np.ndarray) -> np.ndarray:
-        """反归一化参数。使用 float64 以保证 I0 等极小值（如 1e-60）不会在 float32 中下溢为 0。"""
+        """反归一化参数。I0 从对数空间还原。使用 float64 以保证 I0 等极小值不会下溢。"""
         params = np.zeros(len(norm_params), dtype=np.float64)
         for i in range(len(norm_params)):
-            min_val, max_val = self.param_bounds[i]
-            params[i] = min_val + float(norm_params[i]) * (max_val - min_val)
+            if i == 1:  # I0: 对数空间
+                n = float(np.clip(norm_params[i], 0, 1))
+                log_I0 = self._log_I0_low + n * (self._log_I0_high - self._log_I0_low)
+                params[i] = np.exp(log_I0)
+            else:
+                min_val, max_val = self.param_bounds[i]
+                params[i] = min_val + float(norm_params[i]) * (max_val - min_val)
         return params
 
     def _calculate_errors(self,params:np.ndarray)->Dict[str,float]:
@@ -359,58 +392,21 @@ class Env:
 
     def _calculate_reward(self, action: np.ndarray, current_error: float, done: bool) -> float:
         """
-        综合奖励函数（重构：只有降误差才有奖，不降就惩罚，避免不动就有奖导致局部最优）
-        - 核心：奖励与“本步误差相对上一步的下降量”挂钩，不降则给惩罚。
+        势能型奖励函数：
+        - 势能定义为 -error，奖励为势能差（current - prev）；
+        - 等价于奖励 = -(current_error - prev_error)，误差下降时为正；
+        - 不需要额外缩放因子，仅做小范围裁剪，保持数值稳定。
         """
-        errors = self._calculate_errors(self.current_params)
-        reward = 0.0
+        if self.prev_error is None or not np.isfinite(self.prev_error):
+            return 0.0
 
-        # 1. 核心：仅凭“误差是否下降”给奖/罚（不再有 base_reward，不动无奖）
-        if self.prev_error is not None:
-            delta = self.prev_error - current_error  # 正值表示误差下降
-            if delta > 0:
-                # 降误差才有奖：奖励与下降量成正比，低误差区间放大系数
-                scale = 80.0 if current_error <= 0.35 else 20.0
-                reward += scale * delta
-            else:
-                # 不降就惩罚；惩罚不宜过大，否则 Q 全负、策略梯度难以学习（易卡在 0.34）
-                reward -= 0.35
-        # 第一步 prev_error 为 None，不奖不罚改进项，仅保留边界/物理惩罚
+        potential = -float(current_error)
+        prev_potential = -float(self.prev_error)
+        reward = potential - prev_potential  # = -(current_error - prev_error)
 
-        # 2. 边界惩罚（次要，避免参数贴边）
-        boundary_pen = self._calculate_boundary_penalty(self.current_params)
-        reward -= self.reward_weights['boundary'] * boundary_pen
-
-        # 3. 各物理量误差惩罚（次要，引导曲线形状）
-        reward -= self.reward_weights['mpp'] * (errors['mpp_error']**2)
-        reward -= self.reward_weights['short_circuit'] * (errors['short_circuit_error']**2)
-        reward -= self.reward_weights['open_voltage'] * (errors['ov_error_norm']**2)
-        reward -= self.reward_weights['fill_factor'] * (errors['fill_factor_error']**2)
-
-        # 4. 稀疏奖励：仅当“首次突破”某误差阈值时给一次性奖励（属于降误差的里程碑）
-        milestone_map = {
-            'init_break': 0.30,
-            'break_028': 0.28,
-            'break_025': 0.25,
-            'break_020': 0.20
-        }
-        for milestone, thr in milestone_map.items():
-            if current_error < thr and milestone not in self.achieved_milestones:
-                reward += 10.0 if milestone == 'break_028' else 5.0
-                self.achieved_milestones.add(milestone)
-
-        if current_error < self.sparse_thresholds['excellent'] and 'excellent' not in self.achieved_milestones:
-            reward += self.sparse_rewards['global_optimum'] * 1.0
-            self.achieved_milestones.add('excellent')
-
-        # 5. 连续多步无改善时的额外惩罚
-        if self.no_improvement_steps > 100:
-            reward -= 2.0
-            self.no_improvement_steps = 0
-
-        reward = np.clip(reward, -5.0, 15.0)  # 限制奖励范围，稳定Q值估计
-
-        return float(reward)
+        # 裁剪到合理范围，防止异常大步导致的不稳定
+        reward = float(np.clip(reward, -0.1, 0.1))
+        return reward
 
 
     def reset(self, perturb: bool = False, perturb_scale: float = 0.02, initial_params: np.ndarray | None = None) -> np.ndarray:
@@ -443,16 +439,17 @@ class Env:
 
     def _build_state(self, params: np.ndarray, errors: Dict[str, float]) -> np.ndarray:
         """
-        构建10维状态向量：
+        构建9维状态向量：
         - 5个归一化参数
-        - 5个误差指标（主误差归一化、步数归一化、MPP误差归一化、短路误差、开路误差）
+        - 4个误差指标（主误差精细归一化、MPP误差归一化、短路误差、开路误差）
         """
         norm_params = self._normalize_params(params)
 
         err = errors['main_error']
-        main_error_norm = err/0.5
-        main_error_norm=np.clip(main_error_norm,0,1)
-        step_norm = min(self.step_count / 1200.0, 1.0)  # 与 MAX_STEPS 一致
+        # 用传统优化初始误差作为归一化基准，保留精细梯度
+        ref = max(self.rl_start_error, 1e-6)
+        main_error_norm = err / ref
+        main_error_norm = np.clip(main_error_norm, 0, 2)
         mpp_error_norm = errors['mpp_error']  # 已经是0~1之间（相对误差）
         sc_error_norm = errors['short_circuit_error']  # 已归一化
         ov_error_norm = errors['ov_error_norm']  # 已归一化
@@ -460,7 +457,6 @@ class Env:
         state = np.array([
             norm_params[0], norm_params[1], norm_params[2], norm_params[3], norm_params[4],
             main_error_norm,
-            step_norm,
             mpp_error_norm,
             sc_error_norm,
             ov_error_norm
@@ -501,8 +497,8 @@ class Env:
         # 6. 计算奖励
         reward = self._calculate_reward(action, current_error, done=False)  # done暂时False，后面再判断
 
-        # 7. 判断是否终止
-        done = self._check_done()
+        # 7. 判断是否终止（max_steps 由外部传入，支持动态步数）
+        done = self._check_done(max_steps=getattr(self, '_current_max_steps', 500))
 
         # 8. 保存历史（供平滑惩罚等使用）
         self.prev_error = current_error
@@ -521,18 +517,19 @@ class Env:
 
         return self.current_state, reward, done, info
 
-    def _check_done(self) -> bool:
-        """检查终止条件"""
+    def _check_done(self, max_steps: int = 500) -> bool:
+        """检查终止条件。低误差时放宽无改善步数阈值，给更多精细探索机会"""
         if self.best_error < 1e-4:
             return True
-        if self.step_count >= 1200:
+        if self.step_count >= max_steps:
             return True
-        if self.no_improvement_steps >= 200:
+        no_improve_limit = 200
+        if self.no_improvement_steps >= no_improve_limit:
             return True
         return False
 
 class Critic(nn.Module):
-    def __init__(self, state_dim=10, action_dim=5, hidden_dim=512):
+    def __init__(self, state_dim=9, action_dim=5, hidden_dim=512):
         super(Critic, self).__init__()
         # 将状态和动作拼接后输入
         self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
@@ -621,17 +618,36 @@ class TD3Agent:
         self.replay_buffer = ReplayBuffer(buffer_capacity)
         self.noise = GaussianNoise(action_dim)
 
-    def select_action(self, state, add_noise=True):
-        self.actor.eval()
+    def select_action(self, state, add_noise=True, current_best_error: float | None = None):
+        """
+        选择动作。
+        - current_best_error 用于动态调整步长和噪声，误差低时更精细；
+        - 在「误差平台区」（例如约 0.28~0.31）增加额外随机探索，帮助跳出局部最优。
+        """
+        self.actor.eval() 
         with torch.no_grad():
             state_tensor = torch.FloatTensor(state).unsqueeze(0)
             action_tensor = self.actor(state_tensor)
             action = action_tensor.cpu().numpy()[0]
         self.actor.train()
-        if add_noise:
-            noise = self.noise.sample()
-            action += noise
-        return np.clip(action, -self.actor.action_scale, self.actor.action_scale)
+
+        in_burst = self.noise.burst_remaining > 0  # sample() 会递减，需先判断
+
+        # 基础步长：再探索期间始终使用较大步长，其余时间用误差自适应步长
+        scale = self.actor.action_scale_base if in_burst else self.actor.get_action_scale(current_best_error)
+
+        # 平台区间监测：在 0.28~0.31 之间认为可能陷入局部最优，增加随机探索
+        plateau = current_best_error is not None and 0.28 <= current_best_error <= 0.31
+
+        if plateau and np.random.rand() < 0.3:
+            # 以一定概率忽略当前策略，直接在 [-scale, scale] 上均匀采样，强制跳出平台
+            action = np.random.uniform(-scale, scale, size=self.action_dim)
+        else:
+            if add_noise:
+                noise = self.noise.sample(current_best_error=current_best_error)
+                action += noise
+
+        return np.clip(action, -scale, scale)
 
     def update(self):
         if len(self.replay_buffer) < self.batch_size:
@@ -654,7 +670,7 @@ class TD3Agent:
                 -self.noise_clip, self.noise_clip
             )
             next_actions_smooth = (next_actions + noise).clamp(
-                -self.actor.action_scale, self.actor.action_scale
+                -self.actor.action_scale_base, self.actor.action_scale_base
             )
 
             # Clipped Double Q: 取两个 Q 的最小值作为目标，减少过估计
@@ -695,6 +711,11 @@ class TD3Agent:
             with torch.no_grad():
                 actor_loss = -self.critic1(states, self.actor(states)).mean()
 
+        # 周期性再探索：每 3000 次 update 强制放大噪声 200 步，跳出局部最优
+        if self.update_count > 0 and self.update_count % 3000 == 0:
+            self.noise.start_burst(200)
+            print(f"[再探索] Update {self.update_count}: 启动 200 步大探索，噪声重置为 {self.noise.std_original:.3f}")
+
         if self.update_count % 100 == 0:
             q_mean = (current_q1.mean().item() + current_q2.mean().item()) / 2
             print(f"Update {self.update_count}: Critic loss = {critic_loss.item():.4f}, "
@@ -703,41 +724,133 @@ class TD3Agent:
 class GaussianNoise:
     """
     用于 DDPG 探索的高斯噪声生成器。
-    参数：
-        action_dim (int): 动作空间的维度。
-        std (float): 初始标准差，控制噪声的幅度，默认为 0.1。
-        std_decay (float): 每次调用 sample() 后标准差的衰减系数，默认为 0.999。
-        std_min (float): 标准差的最小值，防止衰减到零，默认为 0.01。
+    支持根据 current_best_error 动态调整噪声：误差低时噪声更小，便于精细探索。
+    支持周期性「再探索」：强制放大噪声以跳出局部最优。
     """
-    def __init__(self, action_dim, std=0.1, std_decay=0.999, std_min=0.01):
+    def __init__(self, action_dim, std=0.1, std_decay=0.999, std_min=0.015):
         self.action_dim = action_dim
         self.std = std
         self.std_decay = std_decay
         self.std_min = std_min
         self.std_original = std  # 保存初始值，便于重置
+        self.burst_remaining = 0  # 再探索剩余步数，>0 时使用 std_original 强制大探索
+        self.burst_boost = 1.0  # 再探索时噪声放大倍数，start_burst 会设为 1.5
 
-    def sample(self):
+    def start_burst(self, steps: int = 200):
+        """启动再探索：在接下来 steps 步内使用 1.5 倍初始噪声，强制跳出舒适区"""
+        self.burst_remaining = steps
+        self.burst_boost = 1.5  # 再探索时噪声放大倍数
+
+    def _get_effective_std(self, current_best_error: float | None) -> float:
+        """根据当前误差返回有效噪声标准差：误差低时噪声更小"""
+        base = max(self.std * self.std_decay, self.std_min)
+        self.std = base  # 更新衰减
+        if current_best_error is None:
+            return base
+        if current_best_error <= 0.05:
+            return max(base * 0.02, 0.0005)
+        if current_best_error <= 0.10:
+            return max(base * 0.05, 0.001)
+        if current_best_error <= 0.15:
+            return max(base * 0.1, 0.002)
+        if current_best_error <= 0.20:
+            return max(base * 0.2, 0.005)
+        if current_best_error <= 0.30:
+            return max(base * 0.4, 0.01)   # 误差 0.2~0.3 时，噪声约为 base*0.4
+        if current_best_error <= 0.40:
+            return max(base * 0.6, 0.02)   # 误差 0.3~0.4 时，噪声更大
+        return base
+
+    def sample(self, current_best_error: float | None = None):
         """
         生成一个噪声向量，形状为 (action_dim,)。
-        每次调用后，标准差按衰减系数减小（但不会低于最小值）。
+        current_best_error: 当前最佳误差，用于动态缩小噪声（低误差时更精细探索）。
+        当 burst_remaining > 0 时，强制使用 std_original 进行大探索，跳出局部最优。
         """
-        noise = np.random.normal(0, self.std, size=self.action_dim)
-        # 更新标准差
-        self.std = max(self.std * self.std_decay, self.std_min)
-        return noise
+        if self.burst_remaining > 0:
+            self.burst_remaining -= 1
+            burst_std = self.std_original * getattr(self, 'burst_boost', 1.0)
+            return np.random.normal(0, burst_std, size=self.action_dim)
+        eff_std = self._get_effective_std(current_best_error)
+        return np.random.normal(0, eff_std, size=self.action_dim)
 
     def reset(self):
-        """
-        将标准差重置为初始值。可在每个 episode 开始时调用，
-        使噪声在每个 episode 重新开始衰减。
-        """
+        """将标准差重置为初始值。每个 episode 开始时调用。"""
         self.std = self.std_original
+
+
+def diagnose_critic(agent: TD3Agent, env: Env, num_episodes: int = 5, rollout_len: int = 200):
+    """
+    使用当前策略对环境进行若干次采样，比较：
+    - MC 折扣回报 G_t
+    - Critic 预测的 Q(s_t, a_t)
+    计算两者的皮尔逊相关系数 corr，判断价值网络打分是否合理。
+    """
+    agent.actor.eval()
+    agent.critic1.eval()
+
+    returns = []
+    q_values = []
+
+    for _ in range(num_episodes):
+        state = env.reset(perturb=False)
+        episode_states = []
+        episode_actions = []
+        episode_rewards = []
+
+        # 用当前策略（不加噪声）采样一条轨迹
+        for _ in range(rollout_len):
+            state_tensor = torch.FloatTensor(state).unsqueeze(0)
+            with torch.no_grad():
+                action_tensor = agent.actor(state_tensor)
+            action = action_tensor.cpu().numpy()[0]
+
+            next_state, reward, done, info = env.step(action)
+
+            episode_states.append(state)
+            episode_actions.append(action)
+            episode_rewards.append(reward)
+
+            state = next_state
+            if done:
+                break
+
+        # 从后往前计算每个时间步的折扣回报 G_t
+        G = 0.0
+        disc_returns = []
+        for r in reversed(episode_rewards):
+            G = r + agent.gamma * G
+            disc_returns.insert(0, G)
+
+        # 收集对应的 Q 预测和 MC 回报
+        for s, a, g in zip(episode_states, episode_actions, disc_returns):
+            s_tensor = torch.FloatTensor(s).unsqueeze(0)
+            a_tensor = torch.FloatTensor(a).unsqueeze(0)
+            with torch.no_grad():
+                q_pred = agent.critic1(s_tensor, a_tensor).item()
+            returns.append(g)
+            q_values.append(q_pred)
+
+    agent.actor.train()
+    agent.critic1.train()
+
+    returns = np.array(returns, dtype=np.float32)
+    q_values = np.array(q_values, dtype=np.float32)
+
+    if len(returns) > 1:
+        corr = np.corrcoef(returns, q_values)[0, 1]
+    else:
+        corr = float("nan")
+
+    print(f"[诊断] Critic Q 与 MC 回报相关系数 corr = {corr:.3f}")
+    print(f"[诊断] 回报范围: {returns.min():.3f} ~ {returns.max():.3f}")
+    print(f"[诊断] Q值范围: {q_values.min():.3f} ~ {q_values.max():.3f}")
 
 
 def main():
     # ========== 超参数设置 ==========
     EXCEL_PATH = r"C:\Users\18372\PycharmProjects\pythonProject1\2 (1).xls"  # 请替换为实际数据文件路径
-    STATE_DIM = 10
+    STATE_DIM = 9
     ACTION_DIM = 5
     HIDDEN_DIM = 256  # 提高容量，避免表达能力不足导致误差卡在 0.34 附近
     LR_ACTOR = 3e-4
@@ -746,12 +859,16 @@ def main():
     TAU = 0.001  # 目标网络更新更慢，Q 估计更稳定
     BUFFER_CAPACITY = 100000
     BATCH_SIZE = 128  # 更大 batch 使梯度更平滑
-    NUM_EPISODES = 500
-    MAX_STEPS = 1200  # 更多步数，给 RL 足够时间从 0.28 精细调整
-    NOISE_STD = 0.06   # 适当增大探索噪声，便于跳出局部最优
-    NOISE_DECAY = 0.998 # 衰减稍慢，前期探索更充分
-    NOISE_MIN = 0.008  # 提高最小噪声，后期仍有一定探索
+    NUM_EPISODES = 800  # 给 RL 更多时间探索
+    MAX_STEPS_BASE = 500  # 每 episode 最多步数，避免低效重复
+    MAX_STEPS_LOW_ERR = 500  # 与 BASE 一致
+    NOISE_STD = 0.08   # 原0.06→0.08，初始噪声更大
+    NOISE_DECAY = 0.9995  # 原0.998→0.9995，衰减更慢，探索期更长
+    NOISE_MIN = 0.015  # 原0.008→0.015，最小噪声更大，后期仍有探索
     TARGET_ERROR = 1e-4  # 达到此误差提前停止
+    PERTURB_SCALE = 0.04  # 常规扰动幅度
+    PERTURB_SCALE_STRONG = 0.08  # 卡住时强制大扰动
+    STUCK_THRESHOLD = 25  # 连续多少 episode 无改善则视为卡住
     SAVE_DIR = "./models"
     os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -800,10 +917,11 @@ def main():
     initial_error = _scipy_objective(x0)
     print(f"[传统优化] 初始误差 (default_params): {initial_error:.6f}")
 
-    # 多组随机种子跑 DE，取最优；加强搜索以争取误差 ~0.3
+    # 多组随机种子跑 DE，取最优；同时保留若干较优解作为 RL 的候选起点
     best_de_x = x0.copy()
     best_de_fun = float("inf")
     de_seeds = [42, 123, 456, 789, 2024]  # 5 个种子，提高找到更优解概率
+    de_candidates: list[tuple[float, np.ndarray]] = []
     for run, seed in enumerate(de_seeds):
         print(f"[传统优化] 全局优化 第 {run+1}/{len(de_seeds)} 次 (seed={seed})，请稍候...")
         result_de = differential_evolution(
@@ -818,6 +936,7 @@ def main():
             disp=False,
             atol=1e-8,
         )
+        de_candidates.append((float(result_de.fun), result_de.x.copy()))
         if result_de.fun < best_de_fun:
             best_de_fun = result_de.fun
             best_de_x = result_de.x
@@ -831,11 +950,20 @@ def main():
     else:
         print(f"[传统优化] 全局优化未优于初值 (error={error_de:.6f})，保留原 default_params")
 
+    # 选取若干较优解作为候选起点（按误差排序取前 5 个）
+    de_candidates.sort(key=lambda t: t[0])
+    candidate_params: list[np.ndarray] = []
+    for fun, x_sol in de_candidates[:5]:
+        try:
+            candidate_params.append(_x_to_params(x_sol))
+        except Exception:
+            continue
+
     # 在全局结果基础上用 L-BFGS-B 精修（两轮精修，第二轮从第一轮结果出发）
     try:
         x_start = result_de.x.copy()
         best_so_far = float(result_de.fun)
-        for pass_idx in range(2):
+        for pass_idx in range(1):  # 1轮精修，留优化空间给 RL
             result_lbfgs = minimize(
                 _scipy_objective, x_start,
                 method="L-BFGS-B", bounds=bounds_log_I0,
@@ -853,6 +981,7 @@ def main():
 
     # 明确打印 RL 起点误差，便于排查“误差卡在 0.34”是否因传统优化只做到该水平
     rl_start_error = env._objective_function(env.default_params, env.V, env.I)
+    env.rl_start_error = rl_start_error
     print(f"[传统优化] RL 将从此误差起点开始: {rl_start_error:.6f}")
 
     # 诊断：误差主要来自哪些点（便于判断是否被少数点“绑架”）
@@ -888,27 +1017,54 @@ def main():
 
     # ========== 训练记录 ==========
     best_error_overall = float('inf')
-    best_params_overall = None  # 历史最佳参数，用于热启动，避免每轮都从 0.34 重来
+    best_params_overall = None
+    episodes_without_improvement = 0  # 连续无改善 episode 数
     episode_rewards = []
     episode_errors = []
 
     # ========== 训练循环 ==========
     for episode in range(1, NUM_EPISODES + 1):
-        # 优先从历史最佳参数热启动（>1 轮且已有最佳），约 30% 从传统优化起点+扰动探索
-        use_perturb = (episode > 3) and (episode % 3 == 0)
-        if episode > 1 and best_params_overall is not None and not use_perturb:
-            start_params = best_params_overall
-        elif episode > 1 and best_params_overall is not None and use_perturb:
-            start_params = best_params_overall  # 在最佳点附近扰动
+        # 起点选择策略：
+        # - 若检测到长期无改进：从传统优化默认解出发，施加强扰动，尝试跳出局部最优；
+        # - 每 5 个 episode：从 env.default_params 加较大扰动，打破「总是从历史最佳起步」的桎梏；
+        # - 其它情况：在若干候选较优解之间轮换起点，并施加中等扰动，增加参数空间覆盖度。
+        is_stuck = episodes_without_improvement >= STUCK_THRESHOLD
+        if is_stuck:
+            use_perturb = True
+            perturb_scale = PERTURB_SCALE_STRONG
+            start_params = env.default_params.copy()
+            episodes_without_improvement = 0
+            print(f"[卡住检测] Episode {episode}: 强制从 default_params 大扰动重启 (scale={perturb_scale})")
+        elif episode % 5 == 0:
+            # 周期性从传统优化默认解出发并施加强扰动
+            use_perturb = True
+            perturb_scale = PERTURB_SCALE_STRONG
+            start_params = env.default_params.copy()
+            print(f"[多样起点] Episode {episode}: 从 default_params 强扰动起步 (scale={perturb_scale})")
+        elif len(candidate_params) > 0:
+            # 在若干 DE 得到的较优解之间轮换作为起点
+            use_perturb = True
+            perturb_scale = PERTURB_SCALE
+            idx = (episode - 1) % len(candidate_params)
+            start_params = candidate_params[idx].copy()
+            print(f"[多样起点] Episode {episode}: 使用候选解 #{idx+1} 并加扰动起步")
         else:
-            start_params = None  # 第 1 轮或显式用 default_params
-        state = env.reset(perturb=use_perturb, initial_params=start_params)
+            # 回退策略：从全局历史最佳起步
+            use_perturb = True
+            perturb_scale = PERTURB_SCALE
+            start_params = best_params_overall if best_params_overall is not None else None
+
+        state = env.reset(perturb=use_perturb, perturb_scale=perturb_scale, initial_params=start_params)
         episode_reward = 0
         agent.noise.reset()  # 每个episode重置噪声，让探索强度重新开始
 
-        for step in range(MAX_STEPS):
-            # 选择动作（添加噪声）
-            action = agent.select_action(state, add_noise=True)
+        # 低误差时增加步数，给 RL 更多精细探索机会
+        max_steps = MAX_STEPS_LOW_ERR if best_error_overall < 0.32 else MAX_STEPS_BASE
+        env._current_max_steps = max_steps
+
+        for step in range(max_steps):
+            # 选择动作（添加噪声）；传入当前最佳误差，低误差时步长和噪声更小
+            action = agent.select_action(state, add_noise=True, current_best_error=env.best_error)
             # 环境交互
             next_state, reward, done, info = env.step(action)
             # 存储经验
@@ -926,7 +1082,8 @@ def main():
         episode_errors.append(env.best_error)
         if env.best_error < best_error_overall:
             best_error_overall = env.best_error
-            best_params_overall = env.best_params.copy()  # 下一轮从此热启动
+            best_params_overall = env.best_params.copy()
+            episodes_without_improvement = 0
             # 保存最佳模型
             torch.save({
                 'actor': agent.actor.state_dict(),
@@ -935,14 +1092,21 @@ def main():
                 'best_error': best_error_overall,
             }, os.path.join(SAVE_DIR, 'best_model.pth'))
         elif best_params_overall is None:
-            # 首轮未改进时也记录当前最佳，便于第 2 轮热启动
             best_params_overall = env.best_params.copy()
             best_error_overall = env.best_error
+        else:
+            episodes_without_improvement += 1
 
         # 打印进度（带热启动提示）
-        if episode % 5 == 0:
-            warm = " [从历史最佳热启动]" if (episode > 1 and start_params is not None) else ""
-            print(f"Episode {episode:3d} | Reward: {episode_reward:8.2f} | Best Error: {env.best_error:.6f} | 全局最佳: {best_error_overall:.6f}{warm}")
+        warm = " [从历史最佳热启动]" if (episode > 1 and start_params is not None) else ""
+        print(f"Episode {episode:3d} | Reward: {episode_reward:8.2f} | Best Error: {env.best_error:.6f} | 全局最佳: {best_error_overall:.6f}{warm}")
+
+        # 周期性诊断 Critic 质量（每 20 个 episode 一次）
+        if episode % 20 == 0:
+            try:
+                diagnose_critic(agent, env, num_episodes=3, rollout_len=200)
+            except Exception as e:
+                print(f"[诊断] Episode {episode} 期间 Critic 诊断出错: {e}")
 
         # 提前停止
         if best_error_overall < TARGET_ERROR:
@@ -951,6 +1115,12 @@ def main():
 
     print("训练完成！")
     print(f"最佳误差: {best_error_overall}")
+
+    # 训练结束后，对 Critic 进行一次诊断
+    try:
+        diagnose_critic(agent, env, num_episodes=5, rollout_len=200)
+    except Exception as e:
+        print(f"[诊断] 运行 Critic 诊断时出错: {e}")
 
     # 可选：绘制奖励和误差曲线
     try:
